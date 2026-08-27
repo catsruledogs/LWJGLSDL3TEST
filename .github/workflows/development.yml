@@ -11,18 +11,24 @@ on:
 jobs:
   build:
     name: Development build
-    runs-on: macos-14
-    timeout-minutes: 20
+    runs-on: macos-15
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
           submodules: recursive
 
-      - name: Set up Xcode Version
-        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+      - name: Select latest Xcode
+        run: |
+          LATEST_XCODE=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$LATEST_XCODE" ]; then
+            echo "Using $LATEST_XCODE"
+            sudo xcode-select -s "$LATEST_XCODE"
+          fi
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
 
-      # provision the stable zulu jdk 8 runtime environment as structured in the upstream core
       - name: Setup JDK 8 (Zulu)
         uses: actions/setup-java@v5
         id: setup-java
@@ -30,16 +36,13 @@ jobs:
           distribution: 'zulu'
           java-version: '8'
 
-      # initialize essential building and packaging utilities via homebrew infrastructure
       - name: Install brew dependencies
         env:
           HOMEBREW_NO_REQUIRE_TAP_TRUST: 1
         run: |
-          brew untap aws/tap 2>/dev/null || true
           brew update
-          brew install make wget ldid
+          brew install make wget ldid cmake
           sudo mkdir -p /usr/local/bin
-          # map the gmake binary symlink seamlessly across the target build runner paths
           sudo ln -sf /opt/homebrew/bin/gmake /usr/local/bin/gmake
 
       - name: Cache iOS JREs
@@ -47,10 +50,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: depends/
-          key: amethyst-jres-v1
+          key: amethyst-jres-v2
 
-      # resolve and inject core environmental paths and flags directly into the global execution scope
-      - name: Resolve env (paths, SDK)
+      - name: Resolve env
         run: |
           echo "SDKPATH=$(xcrun --sdk iphoneos --show-sdk-path)" >> $GITHUB_ENV
           echo "RUNNER=0" >> $GITHUB_ENV
@@ -58,13 +60,47 @@ jobs:
       - name: Verify tools
         run: |
           gmake --version | head -1
-          ldid -V 2>&1 | head -1 || true
           cmake --version | head -1
-          wget --version | head -1
           xcrun --sdk iphoneos --show-sdk-version
-          echo "SDKPATH=$SDKPATH"
 
-      # Trigger gmake compilation pipelines with inline stderr filtering and execute post-build binary optimization
+      - name: Download & build libSDL3 from source
+        run: |
+          SDL3_VERSION="release-3.4.0"
+          SDL3_DIR="lwjgl-lib/amethyst-prebuilt-libraries-master/SDL/SDL3"
+
+          # Download vanilla SDL3 source
+          rm -rf "$SDL3_DIR"
+          wget -q "https://github.com/libsdl-org/SDL/archive/refs/tags/${SDL3_VERSION}.tar.gz" -O /tmp/sdl3.tar.gz
+          mkdir -p "$SDL3_DIR"
+          tar xzf /tmp/sdl3.tar.gz --strip-components=1 -C "$SDL3_DIR"
+          rm /tmp/sdl3.tar.gz
+
+          # Apply Amethyst patches (hitTest, embed, input bridge registration, etc.)
+          git apply --stat patches/sdl3-amethyst.patch
+          git apply patches/sdl3-amethyst.patch
+
+          # Build for iOS
+          cd "$SDL3_DIR"
+          mkdir -p build-ios && cd build-ios
+          cmake .. \
+            -DCMAKE_SYSTEM_NAME=Darwin \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -DCMAKE_OSX_ARCHITECTURES="arm64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DSDL_VULKAN=ON \
+            -DSDL_METAL=ON \
+            -DSDL_SHARED=ON \
+            -DSDL_STATIC=OFF
+          cmake --build . -j$(sysctl -n hw.ncpu)
+          echo "libSDL3 built successfully"
+          ls -la libSDL3*.dylib
+
+      - name: Install libSDL3 into resources
+        run: |
+          cp lwjgl-lib/amethyst-prebuilt-libraries-master/SDL/SDL3/build-ios/libSDL3.0.dylib \
+             Natives/resources/Frameworks/libSDL3.dylib
+          echo "libSDL3.dylib installed"
+
       - name: Build sideload IPA & TrollStore tIPA
         shell: bash
         run: |
@@ -85,7 +121,6 @@ jobs:
 
           SIGN_FLAGS="CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="
 
-          # WARNING MITIGATION: Filter runtime stderr streams to suppress repetitive upstream vtool signature warnings
           gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=2 $SIGN_FLAGS 2> >(grep -v "vtool warning: code signature will be invalid" >&2)
           
           gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=2 TROLLSTORE_JIT_ENT=1 $SIGN_FLAGS 2> >(grep -v "vtool warning: code signature will be invalid" >&2)
@@ -144,7 +179,6 @@ jobs:
           if-no-files-found: warn
           compression-level: 0
 
-      # extract local compilation cmake diagnostic records upon unexpected pipeline failure
       - name: Upload build logs on failure
         if: failure()
         uses: actions/upload-artifact@v5

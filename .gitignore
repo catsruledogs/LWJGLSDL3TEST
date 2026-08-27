@@ -16,3 +16,4 @@ entitlements.codesign.xml
 /Compare
 /.rule/
 /sample/
+/lwjgl-lib/amethyst-prebuilt-libraries-master/SDL/SDL3/

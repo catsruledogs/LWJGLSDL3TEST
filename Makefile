@@ -133,13 +133,17 @@ METHOD_DIRCHECK   = \
 # iOS = 2, tvOS = 3, iOS Simulator = 7, tvOS Simulator = 8, visionOS = 11, visionOS Simulator = 12
 # https://github.com/apple-oss-distributions/xnu/blob/main/EXTERNAL_HEADERS/mach-o/loader.h
 # TODO: Change Info.plist for visionOS 1.0
+# Note: vtool invalidates existing signatures; re-signing happens afterwards
+# via scripts/resign_adhoc.sh (codesign adhoc), see the payload target.
 METHOD_CHANGE_PLAT = \
 	if [ '$(1)' != '11' ] && [ '$(1)' != '12' ]; then \
 		vtool -arch arm64 -set-build-version $(1) 14.0 16.0 -replace -output $(2) $(2); \
-		ldid -S -M $(2); \
 	else \
 		vtool -arch arm64 -set-build-version $(1) 1.0 1.0 -replace -output $(2) $(2); \
 	fi \
+
+# Function to ad-hoc re-sign a Mach-O with codesign, preserving entitlements.
+METHOD_RESIGN = bash $(SOURCEDIR)/scripts/resign_adhoc.sh $(1)
 	
 # Function to package the application
 METHOD_PACKAGE = \
@@ -366,14 +370,6 @@ payload: native dep_mg java jre assets
 	if [ '$(SLIMMED_ONLY)' != '1' ]; then \
 		cp -R $(OUTPUTDIR)/java_runtimes $(OUTPUTDIR)/Payload/AngelAuraAmethyst.app; \
 	fi
-	ldid -S $(OUTPUTDIR)/Payload/AngelAuraAmethyst.app; \
-	if [ '$(TROLLSTORE_JIT_ENT)' == '1' ]; then \
-		ldid -S$(SOURCEDIR)/entitlements.trollstore.xml $(OUTPUTDIR)/Payload/AngelAuraAmethyst.app/AngelAuraAmethyst; \
-	elif [ '$(PLATFORM)' == '6' ]; then \
-		ldid -S$(SOURCEDIR)/entitlements.codesign.xml $(OUTPUTDIR)/Payload/AngelAuraAmethyst.app/AngelAuraAmethyst; \
-	else \
-		ldid -S$(SOURCEDIR)/entitlements.sideload.xml $(OUTPUTDIR)/Payload/AngelAuraAmethyst.app/AngelAuraAmethyst; \
-	fi
 	chmod -R 755 $(OUTPUTDIR)/Payload
 	# Always run the platform retag — it's idempotent on already-iOS-tagged
 	# Mach-Os, and catches dylibs we drop in fresh from Maven (which ship
@@ -381,8 +377,23 @@ payload: native dep_mg java jre assets
 	# Originally guarded by `[ PLATFORM != 2 ]` on the assumption that all
 	# committed dylibs were already iOS-tagged — that broke when v19 added
 	# the 3.3.5 lwjgl-stb dylib straight from upstream.
+	# vtool invalidates signatures, so ad-hoc re-signing happens below.
 	$(call METHOD_MACHO,$(OUTPUTDIR)/Payload/AngelAuraAmethyst.app,$(call METHOD_CHANGE_PLAT,$(PLATFORM),$$file)); \
 	$(call METHOD_MACHO,$(OUTPUTDIR)/java_runtimes,$(call METHOD_CHANGE_PLAT,$(PLATFORM),$$file));
+	# Re-sign every Mach-O with a proper ad-hoc signature (codesign sets the
+	# CS_ADHOC flag; the previously used ldid produced flags=0x0 blobs that
+	# strict dlopen paths reject). The main binary goes LAST so the bundle's
+	# sealed resources stay valid, and keeps its entitlements.
+	$(call METHOD_MACHO,$(OUTPUTDIR)/Payload/AngelAuraAmethyst.app,$(call METHOD_RESIGN,$$file)); \
+	$(call METHOD_MACHO,$(OUTPUTDIR)/java_runtimes,$(call METHOD_RESIGN,$$file)); \
+	if [ '$(TROLLSTORE_JIT_ENT)' == '1' ]; then \
+		MAIN_ENTS='$(SOURCEDIR)/entitlements.trollstore.xml'; \
+	elif [ '$(PLATFORM)' == '6' ]; then \
+		MAIN_ENTS='$(SOURCEDIR)/entitlements.codesign.xml'; \
+	else \
+		MAIN_ENTS='$(SOURCEDIR)/entitlements.sideload.xml'; \
+	fi; \
+	bash $(SOURCEDIR)/scripts/resign_adhoc.sh $(OUTPUTDIR)/Payload/AngelAuraAmethyst.app/AngelAuraAmethyst "$$MAIN_ENTS"
 	echo '[Amethyst v$(VERSION)] payload - end'
 
 deploy:

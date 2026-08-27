@@ -24,6 +24,258 @@
 
 #include "JavaLauncher.h"
 
+// SDL3 event injection via dlsym — used when GLFW callbacks are NULL (MC 26.3)
+// Only SDL_PushEvent and SDL_GetWindowID are exported from libSDL3.dylib.
+// Internal functions like SDL_SendMouseMotion are NOT exported, so we construct
+// SDL_Event structs and push them directly.
+//
+// We cannot #include <SDL3/SDL_events.h> from the Natives build, so we define
+// the minimal constants and structs we need inline.
+
+// SDL3 event type constants (from SDL_events.h)
+#define SDL3_EVENT_KEY_DOWN        0x300
+#define SDL3_EVENT_KEY_UP          0x301
+#define SDL3_EVENT_MOUSE_MOTION    0x400
+#define SDL3_EVENT_MOUSE_BUTTON_DOWN 0x401
+#define SDL3_EVENT_MOUSE_BUTTON_UP   0x402
+#define SDL3_EVENT_MOUSE_WHEEL     0x403
+
+typedef uint32_t SDL3_WindowID;
+typedef uint32_t SDL3_MouseID;
+typedef uint16_t SDL3_Keymod;
+typedef int      SDL3_Scancode;
+typedef uint32_t SDL3_Keycode;
+
+// SDL3 MouseMotionEvent layout (must match SDL3 ABI exactly)
+typedef struct {
+    uint32_t type;
+    uint32_t reserved;
+    uint64_t timestamp;
+    SDL3_WindowID windowID;
+    SDL3_MouseID which;
+    uint32_t state;
+    float x, y;
+    float xrel, yrel;
+} SDL3_MouseMotionEvent;
+
+// SDL3 MouseButtonEvent layout
+typedef struct {
+    uint32_t type;
+    uint32_t reserved;
+    uint64_t timestamp;
+    SDL3_WindowID windowID;
+    SDL3_MouseID which;
+    uint8_t button;
+    bool down;
+    uint8_t clicks;
+    uint8_t padding;
+    float x, y;
+} SDL3_MouseButtonEvent;
+
+// SDL3 MouseWheelEvent layout
+typedef struct {
+    uint32_t type;
+    uint32_t reserved;
+    uint64_t timestamp;
+    SDL3_WindowID windowID;
+    SDL3_MouseID which;
+    float x, y;
+    uint32_t direction;
+    float mouse_x, mouse_y;
+    int32_t integer_x, integer_y;
+} SDL3_MouseWheelEvent;
+
+// SDL3 KeyboardEvent layout
+typedef struct {
+    uint32_t type;
+    uint32_t reserved;
+    uint64_t timestamp;
+    SDL3_WindowID windowID;
+    uint32_t which;
+    SDL3_Scancode scancode;
+    SDL3_Keycode key;
+    SDL3_Keymod mod;
+    uint16_t raw;
+    bool down;
+    bool repeat;
+} SDL3_KeyboardEvent;
+
+// Union large enough to hold any SDL3 event
+typedef union {
+    uint32_t type;
+    char _padding[128];
+} SDL3_Event;
+
+typedef bool SDL_PushEvent_func(void *event);
+typedef uint32_t SDL_GetWindowID_func(void *window);
+typedef bool SDL_HideCursor_func(void);
+typedef bool SDL_ShowCursor_func(void);
+
+static SDL_PushEvent_func     *pSDL_PushEvent     = NULL;
+static SDL_GetWindowID_func   *pSDL_GetWindowID   = NULL;
+static void *g_sdlWindow = NULL;  // The real SDL3 window pointer
+
+static void initSDLEventFuncs(void) {
+    static BOOL inited = NO;
+    if (inited) return;
+    inited = YES;
+    pSDL_PushEvent   = dlsym(RTLD_DEFAULT, "SDL_PushEvent");
+    pSDL_GetWindowID = dlsym(RTLD_DEFAULT, "SDL_GetWindowID");
+    NSLog(@"[InputDiag] initSDLEventFuncs: PushEvent=%p GetWindowID=%p g_sdlWindow=%p",
+        (void*)pSDL_PushEvent, (void*)pSDL_GetWindowID, g_sdlWindow);
+}
+
+// Called from UIKit_CreateWindow to register the real SDL window
+void Amethyst_SetSDLWindow(void *window) {
+    g_sdlWindow = window;
+    // Re-init in case libSDL3.dylib wasn't loaded at JNI_OnLoad time
+    initSDLEventFuncs();
+    NSLog(@"[InputDiag] Amethyst_SetSDLWindow: %p PushEvent=%p", window, (void*)pSDL_PushEvent);
+}
+
+static SDL3_WindowID getSDLWindowID(void) {
+    if (g_sdlWindow && pSDL_GetWindowID) {
+        return pSDL_GetWindowID(g_sdlWindow);
+    }
+    return 0;
+}
+
+// Push a mouse motion event into SDL's event queue
+static void pushSDLMouseMotion(float x, float y, float xrel, float yrel) {
+    if (!pSDL_PushEvent || !g_sdlWindow) return;
+    SDL3_MouseMotionEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = SDL3_EVENT_MOUSE_MOTION;
+    ev.windowID = getSDLWindowID();
+    ev.which = 0;
+    ev.state = 0;
+    ev.x = x;
+    ev.y = y;
+    ev.xrel = xrel;
+    ev.yrel = yrel;
+    pSDL_PushEvent((void*)&ev);
+}
+
+// Push a mouse button event into SDL's event queue
+// sdlButton: 1=left, 2=middle, 3=right (SDL convention)
+static void pushSDLMouseButton(uint8_t sdlButton, bool down, float x, float y) {
+    if (!pSDL_PushEvent || !g_sdlWindow) return;
+    SDL3_MouseButtonEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = down ? SDL3_EVENT_MOUSE_BUTTON_DOWN : SDL3_EVENT_MOUSE_BUTTON_UP;
+    ev.windowID = getSDLWindowID();
+    ev.which = 0;
+    ev.button = sdlButton;
+    ev.down = down;
+    ev.clicks = 1;
+    ev.x = x;
+    ev.y = y;
+    pSDL_PushEvent((void*)&ev);
+}
+
+// Push a keyboard event into SDL's event queue
+static void pushSDLKeyboardEvent(SDL3_Scancode scancode, bool down) {
+    if (!pSDL_PushEvent || !g_sdlWindow) return;
+    SDL3_KeyboardEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = down ? SDL3_EVENT_KEY_DOWN : SDL3_EVENT_KEY_UP;
+    ev.windowID = getSDLWindowID();
+    ev.which = 0;
+    ev.scancode = scancode;
+    ev.key = 0;
+    ev.mod = 0;
+    ev.down = down;
+    ev.repeat = false;
+    pSDL_PushEvent((void*)&ev);
+}
+
+// Push a mouse wheel event into SDL's event queue
+static void pushSDLMouseWheel(float x, float y) {
+    if (!pSDL_PushEvent || !g_sdlWindow) return;
+    SDL3_MouseWheelEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = SDL3_EVENT_MOUSE_WHEEL;
+    ev.windowID = getSDLWindowID();
+    ev.which = 0;
+    ev.x = x;
+    ev.y = y;
+    ev.direction = 0;
+    ev.mouse_x = cursorX;
+    ev.mouse_y = cursorY;
+    ev.integer_x = (int32_t)x;
+    ev.integer_y = (int32_t)y;
+    pSDL_PushEvent((void*)&ev);
+}
+
+// GLFW keycode → SDL_Scancode conversion
+static int glfwKeyToSDLScancode(int glfwKey) {
+    // Printable keys: ASCII-based, same as USB HID usage
+    if (glfwKey >= GLFW_KEY_A && glfwKey <= GLFW_KEY_Z) return 4 + (glfwKey - GLFW_KEY_A);   // SDL_SCANCODE_A=4
+    if (glfwKey >= GLFW_KEY_0 && glfwKey <= GLFW_KEY_9) return 39 + (glfwKey - GLFW_KEY_0);   // SDL_SCANCODE_0=39
+    if (glfwKey >= GLFW_KEY_F1 && glfwKey <= GLFW_KEY_F25) return 58 + (glfwKey - GLFW_KEY_F1); // SDL_SCANCODE_F1=58
+    if (glfwKey >= GLFW_KEY_NUMPAD_0 && glfwKey <= GLFW_KEY_NUMPAD_9) return 98 + (glfwKey - GLFW_KEY_NUMPAD_0);
+    switch (glfwKey) {
+        case GLFW_KEY_SPACE:           return 44;
+        case GLFW_KEY_APOSTROPHE:      return 52;
+        case GLFW_KEY_COMMA:           return 54;
+        case GLFW_KEY_MINUS:           return 45;
+        case GLFW_KEY_PERIOD:          return 55;
+        case GLFW_KEY_SLASH:           return 56;
+        case GLFW_KEY_SEMICOLON:       return 51;
+        case GLFW_KEY_EQUAL:           return 46;
+        case GLFW_KEY_LEFT_BRACKET:    return 47;
+        case GLFW_KEY_BACKSLASH:       return 49;
+        case GLFW_KEY_RIGHT_BRACKET:   return 48;
+        case GLFW_KEY_GRAVE_ACCENT:    return 53;
+        case GLFW_KEY_ESCAPE:          return 41;
+        case GLFW_KEY_ENTER:           return 40;
+        case GLFW_KEY_TAB:             return 43;
+        case GLFW_KEY_BACKSPACE:       return 42;
+        case GLFW_KEY_INSERT:          return 73;
+        case GLFW_KEY_DELETE:          return 76;
+        case GLFW_KEY_DPAD_RIGHT:      return 79;
+        case GLFW_KEY_DPAD_LEFT:       return 80;
+        case GLFW_KEY_DPAD_DOWN:       return 81;
+        case GLFW_KEY_DPAD_UP:         return 82;
+        case GLFW_KEY_PAGE_UP:         return 75;
+        case GLFW_KEY_PAGE_DOWN:       return 78;
+        case GLFW_KEY_HOME:            return 74;
+        case GLFW_KEY_END:             return 77;
+        case GLFW_KEY_CAPS_LOCK:       return 57;
+        case GLFW_KEY_SCROLL_LOCK:     return 71;
+        case GLFW_KEY_NUM_LOCK:        return 83;
+        case GLFW_KEY_PRINT_SCREEN:    return 70;
+        case GLFW_KEY_PAUSE:           return 72;
+        case GLFW_KEY_LEFT_SHIFT:      return 225;
+        case GLFW_KEY_LEFT_CONTROL:    return 224;
+        case GLFW_KEY_LEFT_ALT:        return 226;
+        case GLFW_KEY_LEFT_SUPER:      return 227;
+        case GLFW_KEY_RIGHT_SHIFT:     return 229;
+        case GLFW_KEY_RIGHT_CONTROL:   return 228;
+        case GLFW_KEY_RIGHT_ALT:       return 230;
+        case GLFW_KEY_RIGHT_SUPER:     return 231;
+        case GLFW_KEY_MENU:            return 101;
+        case GLFW_KEY_NUMPAD_ADD:      return 87;
+        case GLFW_KEY_NUMPAD_SUBTRACT: return 86;
+        case GLFW_KEY_NUMPAD_MULTIPLY: return 85;
+        case GLFW_KEY_NUMPAD_DIVIDE:   return 84;
+        case GLFW_KEY_NUMPAD_DECIMAL:  return 220;
+        case GLFW_KEY_NUMPAD_ENTER:    return 88;
+        case GLFW_KEY_NUMPAD_EQUAL:    return 103;
+        default:                       return 0; // SDL_SCANCODE_UNKNOWN
+    }
+}
+
+// SDL button ID mapping: GLFW uses 0-based, SDL uses 1-based
+static uint8_t glfwButtonToSDLButton(int glfwButton) {
+    switch (glfwButton) {
+        case GLFW_MOUSE_BUTTON_LEFT:   return 1; // SDL_BUTTON_LEFT
+        case GLFW_MOUSE_BUTTON_RIGHT:  return 3; // SDL_BUTTON_RIGHT
+        case GLFW_MOUSE_BUTTON_MIDDLE: return 2; // SDL_BUTTON_MIDDLE
+        default:                       return (uint8_t)(glfwButton + 1);
+    }
+}
+
 jint (*orig_ProcessImpl_forkAndExec)(JNIEnv *env, jobject process, jint mode, jbyteArray helperpath, jbyteArray prog, jbyteArray argBlock, jint argc, jbyteArray envBlock, jint envc, jbyteArray dir, jintArray std_fds, jboolean redirectErrorStream);
 jlong (*orig_ProcessHandleImpl_isAlive0)(JNIEnv *env, jclass clazz, jlong jpid);
 
@@ -250,6 +502,9 @@ void JNI_OnLoadGLFW() {
 jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     runtimeJavaVMPtr = vm;
 
+    // Initialize SDL3 event function pointers for MC 26.3+ input
+    initSDLEventFuncs();
+
     JNIEnv *env;
     (*runtimeJavaVMPtr)->GetEnv(runtimeJavaVMPtr, (void **)&env, JNI_VERSION_1_4);
     registerOpenHandler(env);
@@ -294,11 +549,20 @@ void handleFramebufferSizeJava(void* window, int w, int h) {
 
 void pojavPumpEvents(void* window) {
     static BOOL setInputReady = NO;
+    static int pumpCount = 0;
     if(!setInputReady) {
         setInputReady = YES;
         CallbackBridge_nativeSetInputReady(YES);
+        NSLog(@"[InputDiag] pojavPumpEvents: isInputReady set to YES, showingWindow=%p", (void*)showingWindow);
     }
-    //__android_log_print(ANDROID_LOG_INFO, "input_bridge_v3", "pojavPumpevents %d", eventCounter);
+    pumpCount++;
+    if (pumpCount <= 5 || pumpCount % 300 == 0) {
+        NSLog(@"[InputDiag] pojavPumpEvents #%d: window=%p GLFW_invoke_Key=%p GLFW_invoke_CursorPos=%p GLFW_invoke_Char=%p isGrabbing=%d isUseStackQueue=%d eventCounter=%d",
+            pumpCount, window,
+            (void*)GLFW_invoke_Key, (void*)GLFW_invoke_CursorPos, (void*)GLFW_invoke_Char,
+            isGrabbing, isUseStackQueueCall,
+            (int)atomic_load_explicit(&eventCounter, memory_order_relaxed));
+    }
     size_t counter = atomic_load_explicit(&eventCounter, memory_order_acquire);
     if((cLastX != cursorX || cLastY != cursorY) && GLFW_invoke_CursorPos) {
         cLastX = cursorX;
@@ -449,6 +713,25 @@ JNIEXPORT jstring JNICALL Java_org_lwjgl_glfw_CallbackBridge_nativeClipboard(JNI
 JNIEXPORT void JNICALL Java_org_lwjgl_glfw_CallbackBridge_nativeSetGrabbing(JNIEnv* env, jclass clazz, jboolean grabbing, jfloat xset, jfloat yset) {
     isGrabbing = grabbing;
 
+    // Manage SDL cursor visibility: hide when grabbing (in-game), show when not (menu)
+    static SDL_HideCursor_func *pSDL_HideCursor = NULL;
+    static SDL_ShowCursor_func *pSDL_ShowCursor = NULL;
+    static BOOL cursorFuncsResolved = NO;
+    if (!cursorFuncsResolved) {
+        pSDL_HideCursor = dlsym(RTLD_DEFAULT, "SDL_HideCursor");
+        pSDL_ShowCursor = dlsym(RTLD_DEFAULT, "SDL_ShowCursor");
+        cursorFuncsResolved = YES;
+    }
+    if (pSDL_HideCursor && pSDL_ShowCursor) {
+        if (grabbing) {
+            pSDL_HideCursor();
+            NSLog(@"[InputDiag] nativeSetGrabbing: SDL_HideCursor called");
+        } else {
+            pSDL_ShowCursor();
+            NSLog(@"[InputDiag] nativeSetGrabbing: SDL_ShowCursor called");
+        }
+    }
+
     dispatch_async(dispatch_get_main_queue(), ^{
         SurfaceViewController *vc = ((SurfaceViewController *)UIWindow.mainWindow.rootViewController);
         [vc updateGrabState];
@@ -517,8 +800,15 @@ JNIEXPORT void JNICALL Java_org_lwjgl_glfw_CallbackBridge_nativeSendCursorEnter(
 }
 */
 void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y) {
-    if (!GLFW_invoke_CursorPos || !isInputReady) return;
+    static int cursorSendCount = 0;
+    cursorSendCount++;
+    if (cursorSendCount <= 10 || cursorSendCount % 50 == 0) {
+        NSLog(@"[InputDiag] sendCursorPos #%d: event=%d x=%.1f y=%.1f GLFW_invoke_CursorPos=%p isInputReady=%d g_sdlWindow=%p",
+            cursorSendCount, event, x, y,
+            (void*)GLFW_invoke_CursorPos, isInputReady, g_sdlWindow);
+    }
 
+    // Update cursor position tracking regardless
     switch (event) {
         case ACTION_DOWN:
         case ACTION_UP:
@@ -544,8 +834,30 @@ void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y) {
             break;
     }
 
-    if (!isUseStackQueueCall) {
-        GLFW_invoke_CursorPos((void*) showingWindow, (double) cursorX, (double) cursorY);
+    // Path A: GLFW callbacks (older MC versions)
+    if (GLFW_invoke_CursorPos && isInputReady) {
+        if (!isUseStackQueueCall) {
+            GLFW_invoke_CursorPos((void*) showingWindow, (double) cursorX, (double) cursorY);
+        }
+    }
+
+    // Path B: SDL3 events (MC 26.3+)
+    // When GLFW callbacks are NULL, we inject SDL mouse events directly.
+    // ACTION_DOWN/UP need mouse button events; ACTION_MOVE needs motion events.
+    // ACTION_MOVE_MOTION carries deltas for camera rotation (xrel/yrel).
+    if (!GLFW_invoke_CursorPos && g_sdlWindow) {
+        if (event == ACTION_MOVE_MOTION) {
+            // x, y are deltas (from SurfaceViewController's isGrabbing path)
+            // Send as relative motion so MC rotates camera
+            pushSDLMouseMotion((float)cursorX, (float)cursorY, (float)x, (float)y);
+        } else {
+            pushSDLMouseMotion((float)cursorX, (float)cursorY, 0, 0);
+            if (event == ACTION_DOWN) {
+                pushSDLMouseButton(1, true, (float)cursorX, (float)cursorY);
+            } else if (event == ACTION_UP) {
+                pushSDLMouseButton(1, false, (float)cursorX, (float)cursorY);
+            }
+        }
     }
 }
 
@@ -580,6 +892,15 @@ char getKeyModifiers(int key, int action) {
 }
 
 void CallbackBridge_nativeSendKey(int key, int scancode, int action, int mods) {
+    static int keySendCount = 0;
+    keySendCount++;
+    if (keySendCount <= 10 || keySendCount % 50 == 0) {
+        NSLog(@"[InputDiag] sendKey #%d: key=%d scancode=%d action=%d mods=%d GLFW_invoke_Key=%p isInputReady=%d g_sdlWindow=%p",
+            keySendCount, key, scancode, action, mods,
+            (void*)GLFW_invoke_Key, isInputReady, g_sdlWindow);
+    }
+
+    // Path A: GLFW callbacks (older MC versions)
     if (GLFW_invoke_Key && isInputReady) {
         keyDownBuffer[MAX(0, key-31)]=(jbyte)action;
         if (mods == 0) {
@@ -593,6 +914,14 @@ void CallbackBridge_nativeSendKey(int key, int scancode, int action, int mods) {
         }
     }
 
+    // Path B: SDL3 events (MC 26.3+)
+    if (!GLFW_invoke_Key && g_sdlWindow) {
+        int sdlScancode = glfwKeyToSDLScancode(key);
+        if (sdlScancode != 0) {
+            pushSDLKeyboardEvent(sdlScancode, action != 0);
+        }
+    }
+
     // On macOS, Minecraft expects the Command key
     if (key == GLFW_KEY_LEFT_CONTROL) {
         CallbackBridge_nativeSendKey(GLFW_KEY_LEFT_SUPER, 0, action, mods);
@@ -602,6 +931,7 @@ void CallbackBridge_nativeSendKey(int key, int scancode, int action, int mods) {
 }
 
 void CallbackBridge_nativeSendMouseButton(int button, int action, int mods) {
+    // Path A: GLFW callbacks (older MC versions)
     if (isInputReady) {
         if (button == -1) {
         } else if (GLFW_invoke_MouseButton) {
@@ -615,6 +945,11 @@ void CallbackBridge_nativeSendMouseButton(int button, int action, int mods) {
                 GLFW_invoke_MouseButton((void*) showingWindow, button, action, mods);
             }
         }
+    }
+
+    // Path B: SDL3 events (MC 26.3+)
+    if (!GLFW_invoke_MouseButton && g_sdlWindow && button >= 0) {
+        pushSDLMouseButton(glfwButtonToSDLButton(button), action != 0, (float)cursorX, (float)cursorY);
     }
 }
 
@@ -643,6 +978,7 @@ void CallbackBridge_nativeSendScreenSize(int width, int height) {
 }
 
 void CallbackBridge_nativeSendScroll(CGFloat xoffset, CGFloat yoffset) {
+    // Path A: GLFW callbacks
     if (GLFW_invoke_Scroll && isInputReady) {
         if (isUseStackQueueCall) {
             sendDataFloat(EVENT_TYPE_SCROLL, xoffset, yoffset, 0, 0);
@@ -650,8 +986,12 @@ void CallbackBridge_nativeSendScroll(CGFloat xoffset, CGFloat yoffset) {
             GLFW_invoke_Scroll((void*) showingWindow, (double) xoffset, (double) yoffset);
         }
     }
-}
 
+    // Path B: SDL3 events (MC 26.3+)
+    if (!GLFW_invoke_Scroll && g_sdlWindow) {
+        pushSDLMouseWheel((float)xoffset, (float)yoffset);
+    }
+}
 JNIEXPORT void JNICALL Java_org_lwjgl_glfw_GLFW_nglfwSetShowingWindow(JNIEnv* env, jclass clazz, jlong window) {
     showingWindow = (long) window;
 }

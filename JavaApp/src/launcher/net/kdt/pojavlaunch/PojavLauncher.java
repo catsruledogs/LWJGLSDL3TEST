@@ -71,7 +71,17 @@ public class PojavLauncher {
         MCOptionUtils.setDefault("particles", "1");
         MCOptionUtils.setDefault("renderDistance", "2");
         MCOptionUtils.setDefault("simulationDistance", "5");
+        // Disable OIT (Order-Independent Transparency) — the renderpearl
+        // Vulkan pipeline oit_transmittance_flat_clouds fails to compile on
+        // MoltenVK / A11 GPU. graphicsMode 0=Fast,1=Fancy,2=Fabulous(OIT).
+        MCOptionUtils.setDefault("graphicsMode", "0");
+        MCOptionUtils.setDefault("transparency", "0");
         MCOptionUtils.save();
+
+        // Hints for renderpearl to skip OIT pipeline compilation
+        System.setProperty("com.mojang.renderpearl.disableOIT", "true");
+        System.setProperty("com.mojang.renderpearl.skipOIT", "true");
+        System.setProperty("com.mojang.renderpearl.forceNoOIT", "true");
 
         // Setup Forge splash.properties
         File forgeSplashFile = new File(Tools.DIR_GAME_NEW, "config/splash.properties");

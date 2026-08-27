@@ -21,7 +21,7 @@ all: $(TARGETS)
 check_empty_classes:
 	@set -e
 	@echo "Checking for empty class files"
-	$(eval EMPTY_CLASSES := $(shell find $(OUTPUTDIR) -name '*.class' -size 0))
+	$(eval EMPTY_CLASSES := $(shell find $(OUTPUTDIR) -name '*.class' -empty))
 	@if [ -n "$(EMPTY_CLASSES)" ]; then \
 		echo "Error: found empty class files in $@: $(EMPTY_CLASSES)"; \
 		exit 1; \
