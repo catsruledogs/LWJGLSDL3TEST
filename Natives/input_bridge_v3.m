@@ -556,6 +556,46 @@ void pojavPumpEvents(void* window) {
         NSLog(@"[InputDiag] pojavPumpEvents: isInputReady set to YES, showingWindow=%p", (void*)showingWindow);
     }
     pumpCount++;
+
+    // Poll SDL relative mouse mode periodically (not just on touch) so cursor
+    // hides automatically when entering the map, without needing a touch first.
+    if (g_sdlWindow && pumpCount % 30 == 0) {
+        typedef bool (*GetRelModeFunc)(void*);
+        static GetRelModeFunc getRelMode = NULL;
+        static bool inited = false;
+        if (!inited) {
+            getRelMode = (GetRelModeFunc)dlsym(RTLD_DEFAULT, "SDL_GetWindowRelativeMouseMode");
+            inited = true;
+        }
+        if (getRelMode) {
+            bool relMode = getRelMode(g_sdlWindow);
+            if (relMode != isGrabbing) {
+                BOOL wasGrabbing = isGrabbing;
+                isGrabbing = relMode;
+
+                if (!wasGrabbing && relMode) {
+                    pushSDLMouseButton(1, false, (float)cursorX, (float)cursorY);
+                }
+
+                typedef bool (*VoidFunc)(void);
+                static VoidFunc hideCursor = NULL;
+                static VoidFunc showCursor = NULL;
+                if (!hideCursor) hideCursor = (VoidFunc)dlsym(RTLD_DEFAULT, "SDL_HideCursor");
+                if (!showCursor) showCursor = (VoidFunc)dlsym(RTLD_DEFAULT, "SDL_ShowCursor");
+                if (relMode && hideCursor) hideCursor();
+                else if (!relMode && showCursor) showCursor();
+
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    @try {
+                        SurfaceViewController *vc = (SurfaceViewController *)UIWindow.mainWindow.rootViewController;
+                        if (vc) [vc updateGrabState];
+                    } @catch (NSException *e) {}
+                });
+
+                NSLog(@"[InputDiag] isGrabbing synced from SDL (pump): %d", isGrabbing);
+            }
+        }
+    }
     if (pumpCount <= 5 || pumpCount % 300 == 0) {
         NSLog(@"[InputDiag] pojavPumpEvents #%d: window=%p GLFW_invoke_Key=%p GLFW_invoke_CursorPos=%p GLFW_invoke_Char=%p isGrabbing=%d isUseStackQueue=%d eventCounter=%d",
             pumpCount, window,
@@ -843,33 +883,35 @@ void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y) {
                 if (relMode && hideCursor) hideCursor();
                 else if (!relMode && showCursor) showCursor();
 
+                // MC 26.3 uses SDL, not GLFW. glfwSetInputMode is never called,
+                // so guiScale stays at 1. Call updateMCGuiScale to fix hotbar detection.
+                // Must call on JVM-attached thread (not main thread) — runtimeJNIEnvPtr
+                // belongs to the JVM thread; using it from main thread causes SIGSEGV.
+                @try {
+                    jclass uikitClass = (*runtimeJNIEnvPtr)->FindClass(runtimeJNIEnvPtr, "net/kdt/pojavlaunch/uikit/UIKit");
+                    if (uikitClass) {
+                        jmethodID updateScale = (*runtimeJNIEnvPtr)->GetStaticMethodID(runtimeJNIEnvPtr, uikitClass, "updateMCGuiScale", "()V");
+                        if (updateScale) {
+                            (*runtimeJNIEnvPtr)->CallStaticVoidMethod(runtimeJNIEnvPtr, uikitClass, updateScale);
+                            NSLog(@"[InputDiag] updateMCGuiScale called, guiScale=%d", guiScale);
+                        }
+                        (*runtimeJNIEnvPtr)->DeleteLocalRef(runtimeJNIEnvPtr, uikitClass);
+                    }
+                } @catch (NSException *e) {
+                    NSLog(@"[InputDiag] updateMCGuiScale exception: %@", e);
+                }
+
                 // Update UIKit mousePointerView visibility on main thread
-                // Also update guiScale so hotbar touch detection works
                 dispatch_async(dispatch_get_main_queue(), ^{
                     @try {
                         SurfaceViewController *vc = (SurfaceViewController *)UIWindow.mainWindow.rootViewController;
                         if (vc) {
                             [vc updateGrabState];
                         } else {
-                            NSLog(@"[InputDiag] updateGrabState: UIWindow.mainWindow is nil, trying fallback");
+                            NSLog(@"[InputDiag] updateGrabState: UIWindow.mainWindow is nil");
                         }
                     } @catch (NSException *e) {
                         NSLog(@"[InputDiag] updateGrabState exception: %@", e);
-                    }
-
-                    // MC 26.3 uses SDL, not GLFW. glfwSetInputMode is never called,
-                    // so guiScale stays at 1. Call updateMCGuiScale to fix hotbar detection.
-                    @try {
-                        jclass uikitClass = (*runtimeJNIEnvPtr)->FindClass(runtimeJNIEnvPtr, "net/kdt/pojavlaunch/uikit/UIKit");
-                        if (uikitClass) {
-                            jmethodID updateScale = (*runtimeJNIEnvPtr)->GetStaticMethodID(runtimeJNIEnvPtr, uikitClass, "updateMCGuiScale", "()V");
-                            if (updateScale) {
-                                (*runtimeJNIEnvPtr)->CallStaticVoidMethod(runtimeJNIEnvPtr, uikitClass, updateScale);
-                            }
-                            (*runtimeJNIEnvPtr)->DeleteLocalRef(runtimeJNIEnvPtr, uikitClass);
-                        }
-                    } @catch (NSException *e) {
-                        NSLog(@"[InputDiag] updateMCGuiScale exception: %@", e);
                     }
                 });
 
