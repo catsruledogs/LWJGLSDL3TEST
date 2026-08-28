@@ -18,6 +18,8 @@ public final class MacosUtil {
     private MacosUtil() {
     }
 
+    public static final boolean IS_MACOS = false;
+
     public static void disableCloseWindowMenuItem() {
         // No-op: there is no menu bar to tweak outside of macOS.
     }

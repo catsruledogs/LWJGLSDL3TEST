@@ -1062,3 +1062,27 @@ void CallbackBridge_pauseGameIfNeed() {
         CallbackBridge_nativeSendKey(GLFW_KEY_ESCAPE, 0, 0, 0);
     }
 }
+
+// JNI bridge: MC 26.1/26.2 use LWJGL 3.4.1 Java bindings which declare
+// native method "nsetupEnvData" (with "n" prefix), but our prebuilt
+// liblwjgl.dylib exports "setupEnvData" (without "n" prefix).
+// This function bridges the name mismatch by forwarding to the real implementation.
+JNIEXPORT jlong JNICALL Java_org_lwjgl_system_ThreadLocalUtil_nsetupEnvData(
+    JNIEnv *env, jclass clazz, jint functionCount) {
+    typedef jlong (*SetupEnvDataFunc)(JNIEnv*, jclass, jint);
+    static SetupEnvDataFunc realFunc = NULL;
+    static bool resolved = false;
+    if (!resolved) {
+        realFunc = (SetupEnvDataFunc)dlsym(RTLD_DEFAULT,
+            "Java_org_lwjgl_system_ThreadLocalUtil_setupEnvData");
+        resolved = true;
+        if (!realFunc) {
+            NSLog(@"[LWJGL Bridge] nsetupEnvData: setupEnvData not found in loaded libraries!");
+        }
+    }
+    if (realFunc) {
+        return realFunc(env, clazz, functionCount);
+    }
+    NSLog(@"[LWJGL Bridge] nsetupEnvData: FATAL - no implementation found");
+    return 0;
+}
