@@ -803,9 +803,63 @@ void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y) {
     static int cursorSendCount = 0;
     cursorSendCount++;
     if (cursorSendCount <= 10 || cursorSendCount % 50 == 0) {
-        NSLog(@"[InputDiag] sendCursorPos #%d: event=%d x=%.1f y=%.1f GLFW_invoke_CursorPos=%p isInputReady=%d g_sdlWindow=%p",
+        NSLog(@"[InputDiag] sendCursorPos #%d: event=%d x=%.1f y=%.1f GLFW_invoke_CursorPos=%p isInputReady=%d g_sdlWindow=%p isGrabbing=%d",
             cursorSendCount, event, x, y,
-            (void*)GLFW_invoke_CursorPos, isInputReady, g_sdlWindow);
+            (void*)GLFW_invoke_CursorPos, isInputReady, g_sdlWindow, isGrabbing);
+    }
+
+    // Sync isGrabbing from SDL's relative mouse mode (MC 26.3 uses SDL, not GLFW).
+    // When MC enters first-person, it calls SDL_SetWindowRelativeMouseMode(true).
+    // We poll this state to know when to send relative vs absolute motion.
+    if (g_sdlWindow) {
+        typedef bool (*GetRelModeFunc)(void*);
+        static GetRelModeFunc getRelMode = NULL;
+        static bool cursorFuncsInited = NO;
+        static bool lastRelMode = false;
+        if (!cursorFuncsInited) {
+            getRelMode = (GetRelModeFunc)dlsym(RTLD_DEFAULT, "SDL_GetWindowRelativeMouseMode");
+            cursorFuncsInited = YES;
+        }
+        if (getRelMode) {
+            bool relMode = getRelMode(g_sdlWindow);
+            if (relMode != lastRelMode) {
+                lastRelMode = relMode;
+                BOOL wasGrabbing = isGrabbing;
+                isGrabbing = relMode;
+
+                // When entering grab mode, release any held mouse button
+                // (the ACTION_DOWN from the menu touch is never released otherwise)
+                if (!wasGrabbing && relMode) {
+                    pushSDLMouseButton(1, false, (float)cursorX, (float)cursorY);
+                    NSLog(@"[InputDiag] Released stale mouse button on grab enter");
+                }
+
+                // Update cursor visibility via SDL
+                typedef bool (*VoidFunc)(void);
+                static VoidFunc hideCursor = NULL;
+                static VoidFunc showCursor = NULL;
+                if (!hideCursor) hideCursor = (VoidFunc)dlsym(RTLD_DEFAULT, "SDL_HideCursor");
+                if (!showCursor) showCursor = (VoidFunc)dlsym(RTLD_DEFAULT, "SDL_ShowCursor");
+                if (relMode && hideCursor) hideCursor();
+                else if (!relMode && showCursor) showCursor();
+
+                // Update UIKit mousePointerView visibility on main thread
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    @try {
+                        SurfaceViewController *vc = (SurfaceViewController *)UIWindow.mainWindow.rootViewController;
+                        if (vc) {
+                            [vc updateGrabState];
+                        } else {
+                            NSLog(@"[InputDiag] updateGrabState: UIWindow.mainWindow is nil, trying fallback");
+                        }
+                    } @catch (NSException *e) {
+                        NSLog(@"[InputDiag] updateGrabState exception: %@", e);
+                    }
+                });
+
+                NSLog(@"[InputDiag] isGrabbing synced from SDL: %d", isGrabbing);
+            }
+        }
     }
 
     // Update cursor position tracking regardless
@@ -843,14 +897,18 @@ void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y) {
 
     // Path B: SDL3 events (MC 26.3+)
     // When GLFW callbacks are NULL, we inject SDL mouse events directly.
-    // ACTION_DOWN/UP need mouse button events; ACTION_MOVE needs motion events.
-    // ACTION_MOVE_MOTION carries deltas for camera rotation (xrel/yrel).
+    //
+    // When isGrabbing (in-game), we must NOT send mouse buttons here.
+    // The gesture system handles clicks:
+    //   - surfaceOnClick (tap)     → SDL right-click → place block
+    //   - surfaceOnLongpress (hold) → SDL left-click  → break block
+    //   - touchesMoved (drag)      → ACTION_MOVE_MOTION → camera rotation
+    // Sending buttons here causes "always holding left click" problem.
     if (!GLFW_invoke_CursorPos && g_sdlWindow) {
         if (event == ACTION_MOVE_MOTION) {
-            // x, y are deltas (from SurfaceViewController's isGrabbing path)
-            // Send as relative motion so MC rotates camera
             pushSDLMouseMotion((float)cursorX, (float)cursorY, (float)x, (float)y);
-        } else {
+        } else if (!isGrabbing) {
+            // Menu mode: send motion + button events for cursor navigation
             pushSDLMouseMotion((float)cursorX, (float)cursorY, 0, 0);
             if (event == ACTION_DOWN) {
                 pushSDLMouseButton(1, true, (float)cursorX, (float)cursorY);
@@ -858,6 +916,8 @@ void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y) {
                 pushSDLMouseButton(1, false, (float)cursorX, (float)cursorY);
             }
         }
+        // When isGrabbing + ACTION_DOWN/UP: do nothing here.
+        // Gestures (surfaceOnClick/surfaceOnLongpress) handle button events.
     }
 }
 
