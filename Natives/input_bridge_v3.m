@@ -844,6 +844,7 @@ void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y) {
                 else if (!relMode && showCursor) showCursor();
 
                 // Update UIKit mousePointerView visibility on main thread
+                // Also update guiScale so hotbar touch detection works
                 dispatch_async(dispatch_get_main_queue(), ^{
                     @try {
                         SurfaceViewController *vc = (SurfaceViewController *)UIWindow.mainWindow.rootViewController;
@@ -854,6 +855,21 @@ void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y) {
                         }
                     } @catch (NSException *e) {
                         NSLog(@"[InputDiag] updateGrabState exception: %@", e);
+                    }
+
+                    // MC 26.3 uses SDL, not GLFW. glfwSetInputMode is never called,
+                    // so guiScale stays at 1. Call updateMCGuiScale to fix hotbar detection.
+                    @try {
+                        jclass uikitClass = (*runtimeJNIEnvPtr)->FindClass(runtimeJNIEnvPtr, "net/kdt/pojavlaunch/uikit/UIKit");
+                        if (uikitClass) {
+                            jmethodID updateScale = (*runtimeJNIEnvPtr)->GetStaticMethodID(runtimeJNIEnvPtr, uikitClass, "updateMCGuiScale", "()V");
+                            if (updateScale) {
+                                (*runtimeJNIEnvPtr)->CallStaticVoidMethod(runtimeJNIEnvPtr, uikitClass, updateScale);
+                            }
+                            (*runtimeJNIEnvPtr)->DeleteLocalRef(runtimeJNIEnvPtr, uikitClass);
+                        }
+                    } @catch (NSException *e) {
+                        NSLog(@"[InputDiag] updateMCGuiScale exception: %@", e);
                     }
                 });
 
@@ -898,26 +914,21 @@ void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y) {
     // Path B: SDL3 events (MC 26.3+)
     // When GLFW callbacks are NULL, we inject SDL mouse events directly.
     //
-    // When isGrabbing (in-game), we must NOT send mouse buttons here.
-    // The gesture system handles clicks:
-    //   - surfaceOnClick (tap)     → SDL right-click → place block
-    //   - surfaceOnLongpress (hold) → SDL left-click  → break block
+    // The raw touch path NEVER sends mouse buttons.
+    // All clicks are handled by the gesture system:
+    //   - surfaceOnClick (tap)     → SDL right-click (place) or left-click (menu)
+    //   - surfaceOnLongpress (hold) → SDL left-click (break)
     //   - touchesMoved (drag)      → ACTION_MOVE_MOTION → camera rotation
-    // Sending buttons here causes "always holding left click" problem.
+    //
+    // If we also sent buttons here, every tap would double-click
+    // (once from raw touch, once from gesture).
     if (!GLFW_invoke_CursorPos && g_sdlWindow) {
         if (event == ACTION_MOVE_MOTION) {
             pushSDLMouseMotion((float)cursorX, (float)cursorY, (float)x, (float)y);
-        } else if (!isGrabbing) {
-            // Menu mode: send motion + button events for cursor navigation
+        } else {
+            // Menu or in-game: always send cursor position (absolute or delta)
             pushSDLMouseMotion((float)cursorX, (float)cursorY, 0, 0);
-            if (event == ACTION_DOWN) {
-                pushSDLMouseButton(1, true, (float)cursorX, (float)cursorY);
-            } else if (event == ACTION_UP) {
-                pushSDLMouseButton(1, false, (float)cursorX, (float)cursorY);
-            }
         }
-        // When isGrabbing + ACTION_DOWN/UP: do nothing here.
-        // Gestures (surfaceOnClick/surfaceOnLongpress) handle button events.
     }
 }
 
