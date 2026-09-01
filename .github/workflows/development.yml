@@ -76,8 +76,8 @@ jobs:
           rm /tmp/sdl3.tar.gz
 
           # Apply Amethyst patches (hitTest, embed, input bridge registration, etc.)
-          git apply --stat patches/sdl3-amethyst.patch
-          git apply patches/sdl3-amethyst.patch
+          git apply --stat --directory="$SDL3_DIR" patches/sdl3-amethyst.patch
+          git apply --directory="$SDL3_DIR" patches/sdl3-amethyst.patch
 
           # Build for iOS
           cd "$SDL3_DIR"
