@@ -83,7 +83,7 @@ jobs:
           cd "$SDL3_DIR"
           mkdir -p build-ios && cd build-ios
           cmake .. \
-            -DCMAKE_SYSTEM_NAME=Darwin \
+            -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
             -DCMAKE_OSX_ARCHITECTURES="arm64" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
