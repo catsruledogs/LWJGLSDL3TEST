@@ -514,6 +514,41 @@ index 463f490..0144644 100644
 -            data.uiwindow.rootViewController = nil;
 -            data.uiwindow.hidden = YES;
 +            Amethyst_OnMainThread(Amethyst_DestroyWindowOnMain, (__bridge void *)data);
- 
+
              CFRelease(window->internal);
              window->internal = NULL;
+
+diff --git a/src/video/uikit/SDL_uikit_amethyst.h b/src/video/uikit/SDL_uikit_amethyst.h
+new file mode 100644
+index 0000000..915f4ff
+--- /dev/null
++++ b/src/video/uikit/SDL_uikit_amethyst.h
+@@ -0,0 +1,28 @@
++#ifndef SDL_uikit_amethyst_h_
++#define SDL_uikit_amethyst_h_
++
++#include <Foundation/Foundation.h>
++#include <dispatch/dispatch.h>
++
++typedef void (*AmethystMainThreadTask)(void *userdata);
++
++static inline void Amethyst_OnMainThread(AmethystMainThreadTask task, void *userdata)
++{
++    if (task == NULL) {
++        return;
++    }
++
++    if ([NSThread isMainThread]) {
++        task(userdata);
++        return;
++    }
++
++    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
++    dispatch_async(dispatch_get_main_queue(), ^{
++        task(userdata);
++        dispatch_semaphore_signal(sem);
++    });
++    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
++}
++
++#endif // SDL_uikit_amethyst_h_
