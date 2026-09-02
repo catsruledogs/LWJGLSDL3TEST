@@ -53,6 +53,19 @@ index e644395..4940d1b 100644
  
      if (SDL_TextInputActive(window)) {
          [textField becomeFirstResponder];
+diff --git a/src/video/uikit/SDL_uikitwindow.h b/src/video/uikit/SDL_uikitwindow.h
+--- a/src/video/uikit/SDL_uikitwindow.h
++++ b/src/video/uikit/SDL_uikitwindow.h
+@@ -49,6 +49,9 @@ extern NSUInteger UIKit_GetSupportedOrientations(SDL_Window *window);
+ @property(nonatomic, strong) SDL_uikitviewcontroller *viewcontroller;
+ 
+ // Array of SDL_uikitviews owned by this window.
+ @property(nonatomic, copy) NSMutableArray *views;
+ 
++// True when the SDL view is embedded in a host UIWindow hierarchy.
++@property(nonatomic, assign) bool amethystEmbedded;
++
+ @end
 diff --git a/src/video/uikit/SDL_uikitwindow.m b/src/video/uikit/SDL_uikitwindow.m
 index 463f490..0144644 100644
 --- a/src/video/uikit/SDL_uikitwindow.m
